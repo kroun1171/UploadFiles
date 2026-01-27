@@ -1,5 +1,7 @@
 package com.example.upload;
 
+import com.example.upload.dto.InitRequest;
+import com.example.upload.dto.InitResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -17,11 +19,16 @@ import software.amazon.awssdk.transfer.s3.model.CompletedFileUpload;
 import software.amazon.awssdk.transfer.s3.model.FileUpload;
 import software.amazon.awssdk.transfer.s3.model.UploadFileRequest;
 
-import java.io.BufferedReader;
-import java.io.File;
-import java.io.InputStreamReader;
+import java.io.*;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.sql.SQLOutput;
+import java.time.Instant;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -31,169 +38,202 @@ public class FileJobService {
     private static final Logger log = LoggerFactory.getLogger(FileJobService.class);
 
     private final S3Client s3Client;
-    private final S3TransferManager transferManager; // Inject this!
+    private final S3TransferManager transferManager;
+    private final Map<String, JobContext> completedJobs = new ConcurrentHashMap<>();
 
     @Value("${backblaze.bucket}")
     private String bucketName;
 
+    private static final Path BASE_DIR =
+            Paths.get(System.getProperty("java.io.tmpdir"), "uploads");
+
     private final Map<String, JobContext> activeJobs = new ConcurrentHashMap<>();
 
-    // Constructor Injection
     public FileJobService(S3Client s3Client, S3TransferManager transferManager) {
         this.s3Client = s3Client;
         this.transferManager = transferManager;
     }
 
-    // --- Upload Method (Parallel Chunking) ---
-    public String uploadFile(MultipartFile file) {
-        String fileName = file.getOriginalFilename();
-        File tempFile = null;
-
+    /* ================= INIT ================= */
+    public InitResponse initUpload(InitRequest req) {
+        String jobId = UUID.randomUUID().toString();
         try {
-            log.info("Starting Multipart upload for: {}", fileName);
-
-            // Convert MultipartFile to temporary File for the TransferManager
-            tempFile = File.createTempFile("upload-", fileName);
-            file.transferTo(tempFile);
-
-            UploadFileRequest uploadFileRequest = UploadFileRequest.builder()
-                    .putObjectRequest(req -> req.bucket(bucketName).key(fileName))
-                    .source(tempFile)
-                    .build();
-
-            FileUpload upload = transferManager.uploadFile(uploadFileRequest);
-            CompletedFileUpload outcome = upload.completionFuture().join(); // Wait for finish
-
-            log.info("Upload successful! ETag: {}", outcome.response().eTag());
-            return fileName;
-
-        } catch (Exception e) {
-            log.error("Upload failed", e);
-            throw new RuntimeException("Failed to upload file", e);
-        } finally {
-            if (tempFile != null && tempFile.exists()) {
-                tempFile.delete(); // Cleanup
-            }
+            Files.createDirectories(BASE_DIR.resolve(jobId));
+            activeJobs.put(jobId,
+                    new JobContext(jobId, req.getFileName(), req.getTotalChunks()));
+            return new InitResponse(jobId, "UPLOADING", Instant.now().toString());
+        } catch (IOException e) {
+            throw new RuntimeException(e);
         }
     }
 
-    // --- Control Methods ---
-    public String submitJob(String fileName) {
-        String jobId = UUID.randomUUID().toString();
-        JobContext context = new JobContext(jobId, fileName);
-        activeJobs.put(jobId, context);
-        processFileAsync(context);
-        return jobId;
+    /* ================= CHUNK UPLOAD ================= */
+    public void uploadChunk(String jobId, int chunkIndex, MultipartFile file) {
+        JobContext ctx = getContext(jobId);
+
+        waitIfPaused(ctx);
+        if (ctx.cancelled) throw new RuntimeException("Cancelled");
+
+        try {
+            Path chunkPath = BASE_DIR.resolve(jobId)
+                    .resolve("chunk_" + chunkIndex + ".part");
+            System.out.println(chunkPath.toString());
+            Files.copy(file.getInputStream(), chunkPath,
+                    StandardCopyOption.REPLACE_EXISTING);
+
+            ctx.receivedChunks.add(chunkIndex);
+            log.info("Chunk {} uploaded for {}", chunkIndex, jobId);
+
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
     }
 
+    /* ================= COMPLETE ================= */
+    public void completeUpload(String jobId) {
+        JobContext ctx = getContext(jobId);
+
+        if (!ctx.allChunksReceived()) {
+            throw new RuntimeException("Missing chunks");
+        }
+
+        try {
+            Path jobDir = BASE_DIR.resolve(jobId);
+            Path merged = jobDir.resolve(ctx.fileName);
+
+            try (OutputStream os = Files.newOutputStream(merged)) {
+                for (int i = 0; i < ctx.totalChunks; i++) {
+                    waitIfPaused(ctx);
+                    if (ctx.cancelled) {
+                        ctx.status = "CANCELLED";
+                        return;
+                    }
+                    Files.copy(jobDir.resolve("chunk_" + i + ".part"), os);
+                }
+            }
+
+            uploadToS3(merged, ctx.fileName);
+            ctx.status = "UPLOADED";
+
+            processFileAsync(ctx); // async starts here
+
+        } catch (Exception e) {
+            ctx.status = "FAILED";
+            throw new RuntimeException(e);
+        }
+    }
+
+    /* ================= S3 ================= */
+    private void uploadToS3(Path file, String key) {
+        UploadFileRequest req = UploadFileRequest.builder()
+                .putObjectRequest(b -> b.bucket(bucketName).key(key))
+                .source(file)
+                .build();
+
+        transferManager.uploadFile(req).completionFuture().join();
+        log.info("S3 upload done: {}", key);
+    }
+
+    /* ================= CONTROL ================= */
     public void pauseJob(String jobId) {
-        JobContext ctx = activeJobs.get(jobId);
-        if (ctx != null) ctx.setPaused(true);
+        getContext(jobId).paused = true;
     }
 
     public void resumeJob(String jobId) {
-        JobContext ctx = activeJobs.get(jobId);
-        if (ctx != null) {
-            ctx.setPaused(false);
-            synchronized (ctx) {
-                ctx.notifyAll();
-            }
+        JobContext ctx = getContext(jobId);
+        synchronized (ctx) {
+            ctx.paused = false;
+            ctx.notifyAll();
         }
     }
 
     public void cancelJob(String jobId) {
-        JobContext ctx = activeJobs.get(jobId);
-        if (ctx != null) {
-            ctx.setCancelled(true);
-            resumeJob(jobId);
-        }
+        JobContext ctx = getContext(jobId);
+        ctx.cancelled = true;
+        resumeJob(jobId);
     }
 
     public String getJobStatus(String jobId) {
-        JobContext ctx = activeJobs.get(jobId);
-        return ctx != null ? ctx.getStatus() : "NOT_FOUND";
+        return getContext(jobId).status;
     }
 
-    // --- Processing Logic (Async) ---
+    /* ================= ASYNC PROCESSING ================= */
     @Async
-    protected void processFileAsync(JobContext ctx) {
-        log.info("Starting job: {}", ctx.jobId);
+    public void processFileAsync(JobContext ctx) {
+        ctx.status = "RUNNING";
+
         try {
             GetObjectRequest request = GetObjectRequest.builder()
                     .bucket(bucketName)
                     .key(ctx.fileName)
                     .build();
 
-            // Using standard Client here for line-by-line reading
-            ResponseInputStream<GetObjectResponse> s3Stream = s3Client.getObject(request);
-
             try (BufferedReader reader = new BufferedReader(
-                    new InputStreamReader(s3Stream, StandardCharsets.UTF_8))) {
+                    new InputStreamReader(s3Client.getObject(request)))) {
 
                 String line;
-                long lineCount = 0;
-
                 while ((line = reader.readLine()) != null) {
-                    if (ctx.isCancelled()) {
-                        log.warn("Job {} cancelled by user.", ctx.jobId);
-                        ctx.setStatus("CANCELLED");
+                    waitIfPaused(ctx);
+                    if (ctx.cancelled) {
+                        ctx.status = "CANCELLED";
                         return;
-                    }
-                    synchronized (ctx) {
-                        while (ctx.isPaused()) {
-                            ctx.setStatus("PAUSED");
-                            log.info("Job {} is paused. Waiting...", ctx.jobId);
-                            ctx.wait();
-                        }
-                    }
-                    ctx.setStatus("RUNNING");
-                    processLineWithRetry(line, ctx, 3);
-                    lineCount++;
-                    if (lineCount % 1000 == 0) {
-                        log.info("Job {} processed {} lines...", ctx.jobId, lineCount);
                     }
                 }
             }
-            ctx.setStatus("COMPLETED");
-            log.info("Job {} finished successfully.", ctx.jobId);
+
+            ctx.status = "COMPLETED";
 
         } catch (Exception e) {
-            log.error("Job failed", e);
-            ctx.setStatus("FAILED: " + e.getMessage());
+            ctx.status = "FAILED";
+        } finally {
+
+                activeJobs.remove(ctx.jobId);
+                completedJobs.put(ctx.jobId, ctx);
+
         }
     }
 
-    private void processLineWithRetry(String line, JobContext ctx, int maxRetries) {
-        int attempt = 0;
-        while (attempt < maxRetries) {
-            try {
-                if (line.contains("error")) throw new RuntimeException("Simulated data error");
-                return;
-            } catch (Exception e) {
-                attempt++;
-                log.warn("Error processing line in Job {}, attempt {}/{}", ctx.jobId, attempt, maxRetries);
-                if (attempt >= maxRetries) log.error("Failed to process line: {}", line);
+
+
+    /* ================= UTIL ================= */
+    private void waitIfPaused(JobContext ctx) {
+        synchronized (ctx) {
+            while (ctx.paused) {
+                try {
+                    ctx.wait();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("Interrupted");
+                }
             }
         }
     }
 
-    private static class JobContext {
+    private JobContext getContext(String jobId) {
+        JobContext ctx = activeJobs.get(jobId);
+        if (ctx == null) throw new RuntimeException("Job not found");
+        return ctx;
+    }
+
+    /* ================= CONTEXT ================= */
+    static class JobContext {
         final String jobId;
         final String fileName;
-        private volatile boolean paused = false;
-        private volatile boolean cancelled = false;
-        private volatile String status = "STARTING";
+        final int totalChunks;
+        final Set<Integer> receivedChunks = ConcurrentHashMap.newKeySet();
 
-        public JobContext(String jobId, String fileName) {
+        volatile boolean paused;
+        volatile boolean cancelled;
+        volatile String status = "UPLOADING";
+
+        JobContext(String jobId, String fileName, int totalChunks) {
             this.jobId = jobId;
             this.fileName = fileName;
+            this.totalChunks = totalChunks;
         }
 
-        public boolean isPaused() { return paused; }
-        public void setPaused(boolean paused) { this.paused = paused; }
-        public boolean isCancelled() { return cancelled; }
-        public void setCancelled(boolean cancelled) { this.cancelled = cancelled; }
-        public String getStatus() { return status; }
-        public void setStatus(String status) { this.status = status; }
+        boolean allChunksReceived() {
+            return receivedChunks.size() == totalChunks;
+        }
     }
 }
